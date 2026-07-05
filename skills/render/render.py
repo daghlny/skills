@@ -2,19 +2,21 @@
 """Render the most recent Claude response as a self-contained HTML page.
 
 This is a pure program: it reads the current session's transcript directly,
-extracts the last assistant text response, fills the HTML template with
-locally-bundled rendering libraries, and opens it in the browser. No model
-involvement is required, so there is no "thinking" latency.
+extracts the last assistant text response, inlines all rendering libraries
+(marked, KaTeX, highlight.js, mermaid) into a single HTML file, and opens it
+in the browser. No model involvement, no network requests.
 
 Usage:
-    render.py            # uses $PWD to locate the project transcript
-    render.py /path/dir  # treat the given dir as the working directory
+    render.py              # uses $PWD to locate the project transcript
+    render.py /path/dir    # treat the given dir as the working directory
+    render.py --md FILE    # render an arbitrary markdown file (for testing)
 """
 
 import glob
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.parse
@@ -101,32 +103,56 @@ REQUIRED_ASSETS = [
     "katex.min.css",
     "github.min.css",
     "katex.min.js",
-    "auto-render.min.js",
     "marked.min.js",
     "highlight.min.js",
+    "mermaid.min.js",
 ]
 
 
-def check_assets(assets_dir):
-    """Fail loudly if a required local asset is missing (avoids a silent
-    blank page where one un-loaded script breaks JS rendering)."""
-    missing = [a for a in REQUIRED_ASSETS if not os.path.isfile(os.path.join(assets_dir, a))]
-    if missing:
+def read_asset(assets_dir, name):
+    path = os.path.join(assets_dir, name)
+    if not os.path.isfile(path):
         sys.exit(
-            "Missing rendering assets in {0}:\n  {1}\n"
-            "The page renders via JavaScript, so a missing library would show a "
-            "blank page. Re-run the skill's install/sync to restore assets/.".format(
-                assets_dir, "\n  ".join(missing)
-            )
+            f"Missing rendering asset: {path}\n"
+            "Re-run the skill's install/sync to restore assets/."
         )
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def safe_inline_js(js):
+    """Make JS safe to embed in a <script> tag: a literal '</script' inside
+    the source (even in a string) would terminate the tag early."""
+    return js.replace("</script", "<\\/script").replace("<!--", "<\\!--")
 
 
 def build_html(markdown, assets_dir):
-    assets_url = "file://" + urllib.parse.quote(assets_dir)
+    katex_css = read_asset(assets_dir, "katex.min.css")
+    # The KaTeX css references fonts relatively; the output page lives in
+    # /tmp, so rewrite them to absolute file:// URLs (a failed font load only
+    # degrades typography — it can't blank the page).
+    fonts_url = "file://" + urllib.parse.quote(os.path.join(assets_dir, "fonts"))
+    katex_css = katex_css.replace("url(fonts/", f"url({fonts_url}/")
+
+    scripts = [
+        read_asset(assets_dir, "katex.min.js"),
+        read_asset(assets_dir, "marked.min.js"),
+        read_asset(assets_dir, "highlight.min.js"),
+    ]
+    # mermaid is ~3.5 MB — only inline it when the content actually has a
+    # mermaid code fence.
+    if re.search(r"^\s*(`{3,}|~{3,})\s*mermaid\b", markdown, re.M):
+        scripts.append(read_asset(assets_dir, "mermaid.min.js"))
+
+    libs_js = safe_inline_js("\n;\n".join(scripts))
     escaped = html.escape(markdown, quote=False)
-    return TEMPLATE.replace("__ASSETS__", assets_url).replace(
-        "__CONTENT__", escaped
-    )
+
+    page = TEMPLATE
+    page = page.replace("__KATEX_CSS__", katex_css)
+    page = page.replace("__HLJS_CSS__", read_asset(assets_dir, "github.min.css"))
+    page = page.replace("__LIBS_JS__", libs_js)
+    page = page.replace("__CONTENT__", escaped)
+    return page
 
 
 TEMPLATE = """<!DOCTYPE html>
@@ -135,8 +161,8 @@ TEMPLATE = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude Response</title>
-<link rel="stylesheet" href="__ASSETS__/katex.min.css">
-<link rel="stylesheet" href="__ASSETS__/github.min.css">
+<style>__KATEX_CSS__</style>
+<style>__HLJS_CSS__</style>
 <style>
   body {
     max-width: 800px;
@@ -160,12 +186,19 @@ TEMPLATE = """<!DOCTYPE html>
     line-height: 1.5;
   }
   code { font-family: "SF Mono", "Fira Code", Menlo, monospace; font-size: 0.9em; }
-  p code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
+  p code, li code, td code { background: #f0f0f0; padding: 2px 6px; border-radius: 3px; }
   .katex-display { margin: 1.2em 0; overflow-x: auto; }
   blockquote { border-left: 4px solid #dfe2e5; margin: 0; padding: 0 1em; color: #6a737d; }
   ul, ol { padding-left: 2em; }
   li { margin: 0.3em 0; }
   strong { font-weight: 600; }
+  table { border-collapse: collapse; margin: 1em 0; display: block; overflow-x: auto; }
+  th, td { border: 1px solid #dfe2e5; padding: 6px 13px; }
+  th { background: #f6f8fa; font-weight: 600; }
+  tr:nth-child(2n) td { background: #fafbfc; }
+  img { max-width: 100%; }
+  hr { border: 0; border-top: 1px solid #eee; margin: 2em 0; }
+  pre.mermaid { background: #fff; text-align: center; }
 </style>
 </head>
 <body>
@@ -174,33 +207,86 @@ __CONTENT__
 </div>
 <div id="rendered"></div>
 
-<script src="__ASSETS__/katex.min.js"></script>
-<script src="__ASSETS__/auto-render.min.js"></script>
-<script src="__ASSETS__/marked.min.js"></script>
-<script src="__ASSETS__/highlight.min.js"></script>
+<script>__LIBS_JS__</script>
 <script>
-  const raw = document.getElementById('raw-content').textContent;
+(function () {
+  const raw = document.getElementById('raw-content').textContent
+    .replace(/^\\n+/, '').replace(/\\n+$/, '');
   const target = document.getElementById('rendered');
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function tex(src, display) {
+    try {
+      return katex.renderToString(src, {displayMode: display, throwOnError: false});
+    } catch (e) {
+      return '<code>' + escapeHtml(src) + '</code>';
+    }
+  }
+
   try {
     if (typeof marked === 'undefined') throw new Error('marked.js failed to load');
-    if (typeof hljs !== 'undefined') {
-      marked.setOptions({
-        highlight: function(code, lang) {
-          if (lang && hljs.getLanguage(lang)) {
-            return hljs.highlight(code, {language: lang}).value;
-          }
-          return code;
+
+    // Math is handled as marked extensions so it is tokenized BEFORE the
+    // markdown inline rules run — otherwise `$x_i$` gets mangled into
+    // emphasis. Code blocks/spans are naturally skipped by the tokenizer.
+    const blockMath = {
+      name: 'blockMath', level: 'block',
+      tokenizer(src) {
+        const m = src.match(/^\\$\\$([\\s\\S]+?)\\$\\$/) ||
+                  src.match(/^\\\\\\[([\\s\\S]+?)\\\\\\]/);
+        if (m) return {type: 'blockMath', raw: m[0], text: m[1].trim()};
+      },
+      renderer(t) { return tex(t.text, true); }
+    };
+    const inlineMath = {
+      name: 'inlineMath', level: 'inline',
+      start(src) {
+        const m = src.match(/\\$|\\\\\\(/);
+        return m ? m.index : undefined;
+      },
+      tokenizer(src) {
+        let m = src.match(/^\\$\\$([\\s\\S]+?)\\$\\$/);
+        if (m) return {type: 'inlineMath', raw: m[0], text: m[1].trim(), display: true};
+        // $...$: no space just inside the delimiters, no digit right after
+        // the closing $ (avoids matching prices like "$5 and $10").
+        m = src.match(/^\\$(?!\\s)((?:\\\\.|[^\\\\$\\n])+?)\\$(?!\\d)/);
+        if (m && !/\\s$/.test(m[1]))
+          return {type: 'inlineMath', raw: m[0], text: m[1], display: false};
+        m = src.match(/^\\\\\\(([\\s\\S]+?)\\\\\\)/);
+        if (m) return {type: 'inlineMath', raw: m[0], text: m[1].trim(), display: false};
+      },
+      renderer(t) { return tex(t.text, t.display); }
+    };
+    marked.use({extensions: [blockMath, inlineMath]});
+
+    // Route ```mermaid fences to a <pre class="mermaid"> for mermaid.run();
+    // everything else falls through to the default code renderer.
+    marked.use({
+      renderer: {
+        code(code, infostring) {
+          const lang = (infostring || '').trim().split(/\\s+/)[0];
+          if (lang === 'mermaid')
+            return '<pre class="mermaid">' + escapeHtml(code) + '</pre>';
+          return false;
         }
+      }
+    });
+
+    target.innerHTML = marked.parse(raw);
+
+    if (typeof hljs !== 'undefined') {
+      target.querySelectorAll('pre code').forEach(function (el) {
+        try { hljs.highlightElement(el); } catch (e) {}
       });
     }
-    target.innerHTML = marked.parse(raw);
-    if (typeof renderMathInElement !== 'undefined') {
-      renderMathInElement(target, {
-        delimiters: [
-          {left: '$$', right: '$$', display: true},
-          {left: '$', right: '$', display: false}
-        ],
-        throwOnError: false
+
+    if (typeof mermaid !== 'undefined' && target.querySelector('.mermaid')) {
+      mermaid.initialize({startOnLoad: false, theme: 'default', securityLevel: 'loose'});
+      mermaid.run({querySelector: '#rendered .mermaid'}).catch(function (e) {
+        console.error('mermaid render failed:', e);
       });
     }
   } catch (e) {
@@ -217,6 +303,7 @@ __CONTENT__
     );
     target.appendChild(pre);
   }
+})();
 </script>
 </body>
 </html>
@@ -224,13 +311,18 @@ __CONTENT__
 
 
 def main():
-    cwd = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PWD", os.getcwd())
-    cwd = os.path.abspath(cwd)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     assets_dir = os.path.join(script_dir, "assets")
 
-    transcript = latest_transcript(cwd)
-    markdown = last_response(transcript)
+    if len(sys.argv) > 2 and sys.argv[1] == "--md":
+        with open(sys.argv[2], encoding="utf-8") as f:
+            markdown = f.read()
+    else:
+        cwd = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("PWD", os.getcwd())
+        cwd = os.path.abspath(cwd)
+        transcript = latest_transcript(cwd)
+        markdown = last_response(transcript)
+
     page = build_html(markdown, assets_dir)
     with open(OUT_PATH, "w") as f:
         f.write(page)
